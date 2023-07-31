@@ -1,5 +1,5 @@
 # llama2.rs
-A rust port to run inference on the Llama 2 LLM model. Uses the `ndarray` create to simplify some of the linear algebra.
+A rust port to run inference on the Llama 2 LLM model. Uses the `ndarray` crate to simplify some of the linear algebra.
 
 ## llama2.c
 
