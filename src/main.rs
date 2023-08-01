@@ -1,9 +1,12 @@
 use std::cmp;
+use std::env;
 use std::fs::File;
-use std::io::{BufReader, Read, ErrorKind, Write, self};
+use std::io::{self, BufReader, ErrorKind, Read, Write};
+use std::path::Path;
+use std::time::Instant;
 
 use ndarray::prelude::*;
-
+use rand::Rng;
 
 pub struct Config {
     // transformer params
@@ -11,14 +14,13 @@ pub struct Config {
     hidden_dim: i32,
     n_layers: i32,
     n_heads: i32,
+    #[allow(dead_code)]
     n_kv_heads: i32,
     vocab_size: i32,
     seq_len: i32,
 }
 
-
 impl Config {
-
     pub fn from_binary<R: Read>(input: &mut BufReader<R>) -> Config {
         // load the configs from a binary
         let mut i_buffer = [0u8; std::mem::size_of::<i32>()];
@@ -45,12 +47,12 @@ impl Config {
     }
 }
 
-pub struct TransformerWeights{
+pub struct TransformerWeights {
     // weights for the transformer model layers
-    
+
     // embedding
     token_embedding_table: Array2<f32>, // (vocab_size, dim)
-    
+
     // rms norms
     rms_att_weight: Array2<f32>, // (layer, dim)
     rms_ffn_weight: Array2<f32>, // (layer, dim)
@@ -101,89 +103,67 @@ impl TransformerWeights {
         }
     }
 
-    pub fn from_binary<R: Read>(
-        input: &mut BufReader<R>,
-        config: &Config,
-    ) -> TransformerWeights {
+    pub fn from_binary<R: Read>(input: &mut BufReader<R>, config: &Config) -> TransformerWeights {
         // load the weights from a binary buffer reader
-        // TODO: make this nicer
         let vocab_size = config.vocab_size.try_into().unwrap();
         let n_layers = config.n_layers.try_into().unwrap();
         let dim = config.dim.try_into().unwrap();
         let hidden_dim = config.hidden_dim.try_into().unwrap();
         let seq_len = config.seq_len.try_into().unwrap();
-        let half_dim: usize = (config.dim / 2).try_into().unwrap();
         let per_head = (config.dim / (2 * config.n_heads)).try_into().unwrap();
 
-        let next_bytes = read_num_floats(input, config.vocab_size * config.dim);
-        let embs = Array::from_shape_vec((vocab_size, dim), next_bytes).unwrap();
+        let mut read_weights = |size: (usize, usize, usize)| {
+            // read the number of bytes from the input buffer and return a 3d Array
+            let num = size.0 * size.1 * size.2;
+            let next_bytes = read_num_floats(input, num.try_into().unwrap());
+            Array::from_shape_vec(size, next_bytes).unwrap()
+        };
 
-        let next_bytes = read_num_floats(input, config.n_layers * config.dim);
-        let rms_att_weight = Array::from_shape_vec((n_layers, dim), next_bytes).unwrap();
-
-        let next_bytes = read_num_floats(input, config.n_layers * config.dim * config.dim);
-        let wq = Array::from_shape_vec((n_layers, dim, dim), next_bytes).unwrap();
-
-        let next_bytes = read_num_floats(input, config.n_layers * config.dim * config.dim);
-        let wk = Array::from_shape_vec((n_layers, dim, dim), next_bytes).unwrap();
-
-        let next_bytes = read_num_floats(input, config.n_layers * config.dim * config.dim);
-        let wv = Array::from_shape_vec((n_layers, dim, dim), next_bytes).unwrap();
-
-        let next_bytes = read_num_floats(input, config.n_layers * config.dim * config.dim);
-        let wo = Array::from_shape_vec((n_layers, dim, dim), next_bytes).unwrap();
-
-        let next_bytes = read_num_floats(input, config.n_layers * config.dim);
-        let rms_ffn_weight = Array::from_shape_vec((n_layers, dim), next_bytes).unwrap();
-
-        let next_bytes = read_num_floats(input, config.n_layers * config.hidden_dim * config.dim);
-        let w1 = Array::from_shape_vec((n_layers, hidden_dim, dim), next_bytes).unwrap();
-
-        let next_bytes = read_num_floats(input, config.n_layers * config.hidden_dim * config.dim);
-        let w2 = Array::from_shape_vec((n_layers, dim, hidden_dim), next_bytes).unwrap();
-
-        let next_bytes = read_num_floats(input, config.n_layers * config.hidden_dim * config.dim);
-        let w3 = Array::from_shape_vec((n_layers, hidden_dim, dim), next_bytes).unwrap();
-
-        let next_bytes = read_num_floats(input, config.dim);
-        let rms_final_weight = Array::from_shape_vec((dim,), next_bytes).unwrap();
-    
-        let next_bytes = read_num_floats(input, config.seq_len * config.dim / (2 * config.n_heads));
-        let freq_cis_real = Array::from_shape_vec((seq_len, per_head), next_bytes).unwrap();
-
-        let next_bytes = read_num_floats(input, config.seq_len * config.dim / (2 * config.n_heads));
-        let freq_cis_imag = Array::from_shape_vec((seq_len, per_head), next_bytes).unwrap();
+        let s2 = s![.., .., 0];
+        let token_embedding_table = read_weights((vocab_size, dim, 1)).slice_move(s2);
+        let rms_att_weight = read_weights((n_layers, dim, 1)).slice_move(s2);
+        let wq = read_weights((n_layers, dim, dim));
+        let wk = read_weights((n_layers, dim, dim));
+        let wv = read_weights((n_layers, dim, dim));
+        let wo = read_weights((n_layers, dim, dim));
+        let rms_ffn_weight = read_weights((n_layers, dim, 1)).slice_move(s2);
+        let w1 = read_weights((n_layers, hidden_dim, dim));
+        let w2 = read_weights((n_layers, dim, hidden_dim));
+        let w3 = read_weights((n_layers, hidden_dim, dim));
+        let rms_final_weight = read_weights((dim, 1, 1)).slice_move(s![.., 0, 0]);
+        let freq_cis_real = read_weights((seq_len, per_head, 1)).slice_move(s2);
+        let freq_cis_imag = read_weights((seq_len, per_head, 1)).slice_move(s2);
 
         TransformerWeights {
-            token_embedding_table: embs,
-            rms_att_weight: rms_att_weight,
-            rms_ffn_weight: rms_ffn_weight,
-            wq: wq,
-            wk: wk,
-            wv: wv,
-            wo: wo,
-            w1: w1,
-            w2: w2,
-            w3: w3,
-            rms_final_weight: rms_final_weight,
-            freq_cis_real: freq_cis_real,
-            freq_cis_imag: freq_cis_imag,
+            token_embedding_table,
+            rms_att_weight,
+            rms_ffn_weight,
+            wq,
+            wk,
+            wv,
+            wo,
+            w1,
+            w2,
+            w3,
+            rms_final_weight,
+            freq_cis_real,
+            freq_cis_imag,
         }
     }
 }
 
 pub struct RunState {
-    x: Array1<f32>, // activation at current t (dim,)
-    xb: Array1<f32>, // same but inside residual branch (dim,)
-    xb2: Array1<f32>, // extra buffer for convenience (dim,)
-    hb: Array1<f32>, // buffer for hidden dim in ffn (hidden_dim,)
-    hb2: Array1<f32>, // buffer for hidden dim in ffn (hidden_dim,)
-    q: Array1<f32>, // query (dim,)
-    k: Array1<f32>, // key (dim,)
-    v: Array1<f32>, // value (dim,)
-    att: Array1<f32>, // buffer for scores/attn values (seq_len,)
-    logits: Array1<f32>, // (output_logits,)
-    key_cache: Array3<f32>, // (layer, seq_len, dim)
+    x: Array1<f32>,           // activation at current t (dim,)
+    xb: Array1<f32>,          // same but inside residual branch (dim,)
+    xb2: Array1<f32>,         // extra buffer for convenience (dim,)
+    hb: Array1<f32>,          // buffer for hidden dim in ffn (hidden_dim,)
+    hb2: Array1<f32>,         // buffer for hidden dim in ffn (hidden_dim,)
+    q: Array1<f32>,           // query (dim,)
+    k: Array1<f32>,           // key (dim,)
+    v: Array1<f32>,           // value (dim,)
+    att: Array1<f32>,         // buffer for scores/attn values (seq_len,)
+    logits: Array1<f32>,      // (output_logits,)
+    key_cache: Array3<f32>,   // (layer, seq_len, dim)
     value_cache: Array3<f32>, // (layer, seq_len, dim)
 }
 
@@ -205,8 +185,8 @@ impl RunState {
             v: Array::zeros((dim,)),
             att: Array::zeros((seq_len,)),
             logits: Array::zeros((vocab_size,)),
-            key_cache: Array::zeros((n_layers, seq_len, dim,)),
-            value_cache: Array::zeros((n_layers, seq_len, dim,)),
+            key_cache: Array::zeros((n_layers, seq_len, dim)),
+            value_cache: Array::zeros((n_layers, seq_len, dim)),
         }
     }
 }
@@ -214,7 +194,6 @@ impl RunState {
 mod nn {
     // neural net functions
 
-    use ndarray::prelude::*;
     use super::*;
 
     pub fn rmsnorm(x: &ArrayView1<f32>, weight: &ArrayView1<f32>) -> Array1<f32> {
@@ -234,9 +213,9 @@ mod nn {
         // get the maxmimum of an array
         let m: f32 = {
             x.into_iter()
-            .copied()
-            .max_by(|a, b| a.partial_cmp(b).unwrap())
-            .unwrap()
+                .copied()
+                .max_by(|a, b| a.partial_cmp(b).unwrap())
+                .unwrap()
         };
         m
     }
@@ -259,19 +238,13 @@ mod nn {
         x * (1. / (1. + (-x).exp()))
     }
 
-    pub fn transformer(
-        token: i32,
-        pos: i32,
-        p: &Config,
-        s: &mut RunState,
-        w: &TransformerWeights,
-    ) {
+    pub fn transformer(token: i32, pos: i32, p: &Config, s: &mut RunState, w: &TransformerWeights) {
         let head_size = p.dim / p.n_heads;
 
-        s.x = w.token_embedding_table.index_axis(
-            Axis(0),
-            token.try_into().unwrap()
-        ).to_owned();
+        s.x = w
+            .token_embedding_table
+            .index_axis(Axis(0), token.try_into().unwrap())
+            .to_owned();
 
         let u: usize = pos.try_into().unwrap();
 
@@ -280,7 +253,6 @@ mod nn {
         let freq_cis_imag_row: ArrayView1<f32> = w.freq_cis_imag.index_axis(Axis(0), u);
 
         for l in 0..(p.n_layers) {
-
             let l_u: usize = l.try_into().unwrap();
             let att_weight = w.rms_att_weight.index_axis(Axis(0), l_u);
             s.xb = rmsnorm(&s.x.view(), &att_weight);
@@ -291,7 +263,7 @@ mod nn {
             s.v = s.xb.dot(&w.wv.index_axis(Axis(0), l_u).t());
 
             // apply RoPE rotation to the q and k vectors for each head
-            
+
             for h in 0..(p.n_heads) {
                 let h_low = h * head_size;
                 let h_high = (h + 1) * head_size;
@@ -301,12 +273,10 @@ mod nn {
                 let q_next = q.slice(s![1..;2]);
 
                 let new_q_prev = {
-                    q_prev.to_owned() * freq_cis_real_row
-                    - q_next.to_owned() * freq_cis_imag_row
+                    q_prev.to_owned() * freq_cis_real_row - q_next.to_owned() * freq_cis_imag_row
                 };
                 let new_q_next = {
-                    q_prev.to_owned() * freq_cis_imag_row
-                    + q_next.to_owned() * freq_cis_real_row
+                    q_prev.to_owned() * freq_cis_imag_row + q_next.to_owned() * freq_cis_real_row
                 };
 
                 s.q.slice_mut(s![h_low..h_high;2]).assign(&new_q_prev);
@@ -317,12 +287,10 @@ mod nn {
                 let k_next = k.slice(s![1..;2]);
 
                 let new_k_prev = {
-                    k_prev.to_owned() * freq_cis_real_row
-                    - k_next.to_owned() * freq_cis_imag_row
+                    k_prev.to_owned() * freq_cis_real_row - k_next.to_owned() * freq_cis_imag_row
                 };
                 let new_k_next = {
-                    k_prev.to_owned() * freq_cis_imag_row
-                    + k_next.to_owned() * freq_cis_real_row
+                    k_prev.to_owned() * freq_cis_imag_row + k_next.to_owned() * freq_cis_real_row
                 };
 
                 s.k.slice_mut(s![h_low..h_high;2]).assign(&new_k_prev);
@@ -336,13 +304,10 @@ mod nn {
             // multi-head attention
             let sqrt_head_size: f32 = (head_size as f32).sqrt();
             for h in 0..(p.n_heads) {
-    
                 let h_idx_low: usize = (h * head_size).try_into().unwrap();
                 let h_idx_high: usize = ((h + 1) * head_size).try_into().unwrap();
                 let q_head = s.q.slice(s![h_idx_low..h_idx_high]);
-                let prev_key = s.key_cache.slice(
-                    s![l_u, ..(u + 1), h_idx_low..h_idx_high]
-                ); // (pos, head_size)
+                let prev_key = s.key_cache.slice(s![l_u, ..(u + 1), h_idx_low..h_idx_high]); // (pos, head_size)
 
                 // softmax(QK / sqrt(d))
                 let attn_logits = prev_key.dot(&q_head).map(|a| (a / sqrt_head_size));
@@ -351,9 +316,10 @@ mod nn {
 
                 // attend over value
                 let weighted = {
-                    s.value_cache.slice(
-                        s![l_u, ..(u + 1), h_idx_low..h_idx_high]
-                    ).t().dot(&s.att.slice(s![..(u + 1)]))
+                    s.value_cache
+                        .slice(s![l_u, ..(u + 1), h_idx_low..h_idx_high])
+                        .t()
+                        .dot(&s.att.slice(s![..(u + 1)]))
                 }; // (head_size,)
                 s.xb.slice_mut(s![h_idx_low..h_idx_high]).assign(&weighted);
             }
@@ -399,10 +365,23 @@ mod nn {
         return match arg {
             -1 => Err("No argmax found."),
             x => Ok(x),
+        };
+    }
+
+    pub fn sample(ps: &Array1<f32>) -> i32 {
+        // sample from a probability distribution
+        let mut rng = rand::thread_rng();
+        let mut sum = 0.;
+        let mut ps_cum = Array1::<f32>::zeros(ps.len());
+        for (idx, p) in ps.iter().enumerate() {
+            sum += p;
+            ps_cum[idx] = sum;
         }
+        let r: f32 = rng.gen();
+        let idx = ps_cum.iter().position(|&x| x > r).unwrap();
+        return idx as i32;
     }
 }
-
 
 fn read_num_floats<R: Read>(input: &mut BufReader<R>, n: i32) -> Vec<f32> {
     // read the next n floats from a binary file
@@ -434,22 +413,22 @@ mod tests {
     #[test]
     fn test_rmsnorm() {
         let u = array![0., 1., 0.];
-        let v = nn::rmsnorm(&u.view(), &u.view());
+        let _vv = nn::rmsnorm(&u.view(), &u.view());
     }
 
     #[test]
     fn test_softmax() {
         let u = array![0., 0., 0.];
-        let v = nn::softmax(&u);
-        
+        let _v = nn::softmax(&u);
+
         let u = array![1., 1., 1.];
         let v = nn::softmax(&u);
-        assert_eq!(v, array![1./3., 1./3., 1./3.])
+        assert_eq!(v, array![1. / 3., 1. / 3., 1. / 3.])
     }
 
     #[test]
     fn test_transformer() {
-        let conf = Config{
+        let conf = Config {
             dim: 8,
             hidden_dim: 8,
             n_layers: 2,
@@ -475,117 +454,183 @@ mod tests {
     }
 }
 
-fn load_tokenizer(path: &str, vocab_size: i32) -> Vec<String> {
+fn load_tokenizer(path: &str, vocab_size: i32) -> (Vec<(String, f32)>, i32) {
     // load the vocab from the binary file
     let f = File::open(path).expect("Failed to open file");
     let mut input = BufReader::new(f);
 
-    let mut vocab: Vec<String> = Vec::new();
+    let mut vocab: Vec<(String, f32)> = Vec::new();
     let mut i_buffer = [0u8; std::mem::size_of::<i32>()];
     let mut f_buffer = [0u8; std::mem::size_of::<f32>()];
     let mut s_buffer = [0u8; 1];
 
-    let res = input.read_exact(&mut i_buffer).unwrap();
+    input.read_exact(&mut i_buffer).unwrap();
     let max_token_length = i32::from_le_bytes(i_buffer);
 
     for _ in 0..vocab_size {
-        let res = input.read_exact(&mut f_buffer).unwrap();
+        input.read_exact(&mut f_buffer).unwrap();
         let score = f32::from_le_bytes(f_buffer);
 
-        let res = input.read_exact(&mut i_buffer).unwrap();
+        input.read_exact(&mut i_buffer).unwrap();
         let len = i32::from_le_bytes(i_buffer);
 
         let mut word: String = String::new();
 
         for _ in 0..len {
-            let res = input.read_exact(&mut s_buffer).unwrap();
-            let chr = unsafe {
-                String::from_utf8_unchecked(s_buffer.to_vec())
-            };
+            input.read_exact(&mut s_buffer).unwrap();
+            let chr = unsafe { String::from_utf8_unchecked(s_buffer.to_vec()) };
             word.push_str(&chr);
         }
 
-        vocab.push(word)
+        vocab.push((word, score))
     }
 
-    vocab
+    (vocab, max_token_length)
 }
 
+fn tokenize(text: &[u8], vocab: &Vec<(String, f32)>, max_token_length: i32, bos: bool) -> Vec<i32> {
+    // tokenize a string with BPE
+    // based on leo-du/llama2.rs/blob/master/run.rs#L326
+    let mut tokens: Vec<i32> = Vec::new();
 
+    for i in 0..text.len() {
+        let char: &str = std::str::from_utf8(&text[i..i + 1]).unwrap();
+        let (id, _) = vocab
+            .iter()
+            .enumerate()
+            .find(|x| (*(*x).1).0 == char)
+            .expect("illegal character");
+        tokens.push(id.try_into().unwrap());
+    }
+
+    let mut buffer = String::with_capacity(max_token_length.try_into().unwrap());
+    loop {
+        let mut best = (-1e10_f32, (usize::MAX, usize::MAX)); // (score, (vocab index, tokens index))
+
+        for i in 0..tokens.len() - 1 {
+            buffer.clear();
+            buffer.push_str(&(vocab[(tokens[i] as usize)].0));
+            buffer.push_str(&(vocab[(tokens[i + 1] as usize)].0));
+            if let Some((vid, (_, score))) =
+                vocab.iter().enumerate().find(|x| (*(*x).1).0 == buffer)
+            {
+                if *score > best.0 {
+                    best = (*score, (vid, i));
+                }
+            }
+        }
+
+        if best.1 .0 == usize::MAX {
+            break; // no more possible merges
+        }
+
+        // perform merge
+        tokens[best.1 .1] = best.1 .0.try_into().unwrap();
+        tokens.remove(best.1 .1 + 1);
+    }
+
+    if bos && tokens[0] != 1 {
+        tokens.insert(0, 1);
+    }
+
+    tokens
+}
+
+fn get_next_token(state: &RunState, temperature: f32) -> i32 {
+    // get the next token either greedily or with temperature sampling
+    if temperature == 0. {
+        return nn::argmax1(&state.logits).unwrap();
+    }
+
+    let tempered = state.logits.map(|x| x / temperature);
+    let probs = nn::softmax(&tempered);
+    nn::sample(&probs)
+}
 
 fn inference(
     prompt: Vec<i32>,
     steps: i32,
     config: &Config,
     weights: &TransformerWeights,
-    vocab: &Vec<String>,
+    vocab: &Vec<(String, f32)>,
+    temperature: f32,
 ) {
-    let start_t = 0.;
-    let next = 0;
+    let now = Instant::now();
 
-    let mut token = prompt[0];
+    let mut iterator = prompt.iter();
+    let mut token = *iterator.next().unwrap();
     let mut pos = 0;
     let mut seq: Vec<i32> = vec![token];
     let mut state = RunState::zeros(&config);
 
     let prompt_len: i32 = prompt.len().try_into().unwrap();
-    let max_steps = cmp::max(config.seq_len, prompt_len + steps);
+    let max_steps = cmp::min(config.seq_len, prompt_len + steps);
 
     while pos < max_steps {
-        
         nn::transformer(token, pos, &config, &mut state, &weights);
 
-        if pos < (prompt_len - 1) {
-            token = prompt[(pos + 1) as usize];
-        } else {
-            
-            token = nn::argmax1(&state.logits).unwrap();
-        }
-        
+        token = match iterator.next() {
+            Some(t) => *t,
+            None => get_next_token(&state, temperature),
+        };
 
         pos += 1;
         seq.push(token);
 
-        print!("{}", vocab[token as usize]);
+        print!("{}", vocab[token as usize].0);
         io::stdout().flush().unwrap();
-
     }
+
+    println!(
+        "\nRan at {} tok/s.",
+        (seq.len() as f32) / now.elapsed().as_secs_f32()
+    );
 }
-
-fn test_inference(
-    config: &Config,
-    weights: &TransformerWeights,
-    vocab: &Vec<String>,
-) {
-
-    let mut state = RunState::zeros(&config);
-    //let prompt: Vec<i32> = vec![1, 3118, 2462];
-
-    nn::transformer(10, 0, &config, &mut state, &weights);
-
-    println!("{:?}", state.logits.slice(s![0..10]));
-}
-
 
 fn main() {
+    // run inference on a Llama model
 
-    // convert this to argparse
-    let path = "/Users/hamish/Downloads/stories15M.bin";
-    let temperature = 0.9;
-
-    let mut input = BufReader::new(
-        File::open(path)
-        .expect("Failed to open file")
-    );
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        panic!(
+            "Usage: {} <checkpoint_file> [tokenizer_path] [prompt] [temperature] [max_steps]",
+            &args[0]
+        );
+    }
+    let path: String = String::from(&args[1]);
+    if !Path::new(&path).exists() {
+        panic!("Model path does not exist.");
+    };
+    let mut input = BufReader::new(File::open(path).expect("Failed to open file"));
     let config = Config::from_binary(&mut input);
-    let vocab = load_tokenizer("tokenizer.bin", config.vocab_size);
+
+    let tok_path: String = match args.get(2) {
+        Some(s) => s.to_string(),
+        None => String::from("tokenizer.bin"),
+    };
+    if !Path::new(&tok_path).exists() {
+        panic!("Tokenizer path does not exist.");
+    };
+
+    let (vocab, max_token_length) = load_tokenizer(&tok_path, config.vocab_size);
+    let prompt: Vec<i32> = match args.get(3) {
+        Some(s) => tokenize(s.as_bytes(), &vocab, max_token_length, true),
+        None => vec![
+            1, 3118, 2462, 29892, 263, 2217, 7826, 4257, 365, 2354, 1476, 263, 817, 280, 297, 902,
+            5716, 29889, 2296, 6363,
+        ],
+    };
+
+    let temperature: f32 = match args.get(4) {
+        Some(s) => s.parse::<f32>().expect("Failed to parse temperature."),
+        None => 0.9,
+    };
+
+    let max_steps: i32 = match args.get(5) {
+        Some(s) => s.parse::<i32>().expect("Failed to parse max steps."),
+        None => 20,
+    };
+
     let weights = TransformerWeights::from_binary(&mut input, &config);
-    
-    let prompt: Vec<i32> = vec![
-        1, 3118, 2462, 29892, 263, 2217, 7826, 4257, 365, 2354, 1476, 263, 817,
-        280, 297, 902, 5716, 29889, 2296, 6363
-    ];
-
-    inference(prompt, 20, &config, &weights, &vocab);
-
+    inference(prompt, max_steps, &config, &weights, &vocab, temperature);
 }
